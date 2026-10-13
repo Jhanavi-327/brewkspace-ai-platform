@@ -104,6 +104,40 @@ DOCUMENT_KEYWORDS = {
     ],
 }
 
+def looks_like_rtc(text: str) -> bool:
+    text = text or ""
+    lower = text.lower()
+    compact = re.sub(r"[\s\u200b\u200c\u200d]+", "", text)
+
+    # Clear RTC abbreviation, allowing punctuation and spaces.
+    rtc_title = bool(re.search(r"\br\s*\.?\s*t\s*\.?\s*c\b", lower))
+
+    # OCR can substitute G for C. This requires stronger supporting evidence.
+    damaged_title = bool(re.search(r"\br\s*\.?\s*t\s*\.?\s*g\b", lower))
+
+    kannada_title = (
+        "ರೆಕಾರ್ಡ್" in compact
+        and any(word in compact for word in ("ಗೇಣಿ", "ಗೀಣ"))
+        and "ಪತ್ರಿ" in compact
+    )
+
+    signals = [
+        bool(re.search(r"\bmr\s*[a-z]?\d+\s*/\s*\d{4}", lower)),
+        bool(re.search(r"print\s*page\s*no", lower)),
+        "ಖಾತೆ" in compact,
+        "ಖರಾಬ್" in compact or "ಖರಾಬ" in compact,
+        "ಬೆಳೆಯ" in compact or "ಬೆಳೆಗಳ" in compact,
+        "ನೀರಾವರಿ" in compact,
+        "ಸಾಗುವ" in compact or "ವ್ಯವಸಾಯಗಾರ" in compact,
+    ]
+
+    support = sum(signals)
+    return (
+        (rtc_title and support >= 2)
+        or (kannada_title and support >= 3)
+        or (damaged_title and support >= 4)
+    )
+
 
 def classify_document_text(text: str) -> Dict:
     text = text or ""
@@ -258,10 +292,28 @@ def classify_document_text(text: str) -> Dict:
     # -------------------------------
     # 3. Strong Karnataka RTC Detection
     # -------------------------------
+    # The first three anchors identify an RTC DOWNLOADED from Bhoomi — they are
+    # the site's own URL, its preview path and the form title. A printed or
+    # scanned RTC carries none of them: there is no URL on the page, and the
+    # form title goes through OCR ("Village Account Form No. 2" came back
+    # "AccULlil FDrq11 M, 2" on a Yalahanka RTC). That document reached the
+    # Aadhaar block below and was classified AADHAAR_CARD at 0.97 off its
+    # Bhoomi Land ID, which is printed in the same 4-4-4 shape as an Aadhaar
+    # number. So match the tokens that survive a scan too: the digital-signature
+    # footer, the validity line, the Latin abbreviation, and ಪಹಣಿ — the Kannada
+    # name of this document, which a Patta / Mutation Register / KYC page never
+    # carries (and both of those are decided above this block anyway).
+    text_compact_lower = re.sub(r"\s+", "", text_lower)
+
     if (
-        "previewrtc" in text_lower
+        looks_like_rtc(text)
+        or "previewrtc" in text_lower
         or "landrecords.karnataka.gov.in" in text_lower
         or "village account form no. 2" in text_lower
+        or "rtcdigitallysigned" in text_compact_lower
+        or "totilldate" in text_compact_lower
+        or "r.t.c" in text_lower
+        or "ಪಹಣಿ" in text_compact
     ):
         return {
             "classification": "RTC",
@@ -277,14 +329,17 @@ def classify_document_text(text: str) -> Dict:
     # -------------------------------
     # 4. Strong Aadhaar Card Detection
     # -------------------------------
-    aadhaar_match = re.search(
-        r"\b\d{4}[\s_]*\d{4}[\s_]*\d{4}\b",
-        text
-    )
-
+    # A bare 4-4-4 digit group USED TO BE sufficient on its own. It is not
+    # evidence: a Karnataka RTC prints its Bhoomi Land ID in exactly that shape
+    # ("ಭೂಮಿ ಲ್ಯಾಂಡ್ ಐಡಿ: 6128 8500 0486"), and on the Yalahanka RTC that number
+    # was the ONLY Aadhaar signal in 13,000 characters of text — no UIDAI, no
+    # AADHAAR, not even MALE or ADDRESS — yet it returned AADHAAR_CARD at 0.97.
+    # The number now has to be corroborated by one of the named signals below,
+    # every one of which is still sufficient by itself; the real cards keep
+    # classifying on those (C NAGARAJU has no legible "AADHAAR" anywhere, but
+    # does print MALE).
     if (
-        aadhaar_match
-        or "UNIQUE IDENTIFICATION AUTHORITY" in text_upper
+        "UNIQUE IDENTIFICATION AUTHORITY" in text_upper
         or "UNIQUE IDENTIFICATION" in text_upper
         or "UIDAI" in text_upper
         or "AADHAAR" in text_upper

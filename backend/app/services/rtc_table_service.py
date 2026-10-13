@@ -2,6 +2,8 @@ import cv2
 import fitz
 import numpy as np
 
+from app.services.ocr_service import auto_rotate_for_ocr
+
 from PIL import Image
 from typing import Dict, Any, List
 
@@ -24,7 +26,10 @@ def pdf_page_to_image(
 
     pdf.close()
 
-    return np.array(image)
+    # Same orientation correction as the page-level OCR. Both renderers must
+    # apply it: the grid boxes are measured on one image and the crops taken
+    # from the other, so a rotation applied to only one would misalign them.
+    return auto_rotate_for_ocr(np.array(image))
 
 
 def preprocess_image(image_np):

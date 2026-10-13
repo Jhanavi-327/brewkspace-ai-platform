@@ -56,6 +56,18 @@ class Settings(BaseSettings):
     MR_VERIFY_RETRY: bool = True
     MR_VERIFY_MAX_ATTEMPTS: int = 3
 
+    # LangSmith tracing. Read through Settings like everything else so it
+    # resolves from the same .env; llm_usage then exports these into the
+    # process environment, which is where the LangSmith SDK looks for them.
+    LANGSMITH_TRACING: str | None = None
+    LANGSMITH_API_KEY: str | None = None
+    LANGSMITH_PROJECT: str | None = None
+    LANGSMITH_ENDPOINT: str | None = None
+
+    # Per-million-token Gemini rates as JSON, for per-document cost reporting.
+    GEMINI_PRICES: str | None = None
+    GEMINI_PRICE_CURRENCY: str = "USD"
+
     model_config = SettingsConfigDict(
         env_file=str(ENV_FILE),
         env_file_encoding="utf-8",

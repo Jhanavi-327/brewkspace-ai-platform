@@ -11,8 +11,23 @@ def clean_text(value: str) -> str:
 
 
 # Below this many occurrences across the whole OCR text, the best candidate is
-# indistinguishable from noise (on an unreadable card every candidate scored 2).
-_MIN_NAME_SUPPORT = 3
+# indistinguishable from noise.
+#
+# 3 was set just above the "every candidate scored 2" floor seen on a bare
+# page + embedded-image read. The enhanced pass has since grown to seven
+# preprocessing variants (gray/clahe/otsu/adaptive/sharp, psm 11, psm 12), and
+# a SYSTEMATIC misread repeats across them exactly as a real name does: one
+# engine failing the same way on the same image is not corroboration, but
+# counting cannot tell the two apart. On C NAGARAJU — a card whose embedded
+# images are genuinely too small to read — Tesseract produced "Ge veer" in the
+# embedded-image pass and again under psm 11 and psm 12, reaching 3 and being
+# reported as the holder's name, while the true name ("Negara:", a misread of
+# C Nagaraju) scored 2. EasyOCR never saw "Ge veer" at all.
+#
+# Genuine names clear this by a wide margin — 20 (GIRIJAMMA) and 10
+# (RAMALINGAPPA) in the recorded samples — so raising the floor above what one
+# engine's pass set can manufacture costs the readable cards nothing.
+_MIN_NAME_SUPPORT = 5
 
 
 def extract_crop_field(text: str, field_name: str) -> Optional[str]:
@@ -209,7 +224,8 @@ def extract_name(text: str) -> Optional[str]:
 
 def choose_aadhaar_name(
     text: str,
-    crop_name: Optional[str]
+    crop_name: Optional[str],
+    guardian_name: Optional[str] = None
 ) -> Optional[str]:
     """
     Pick the holder name that the OCR text CORROBORATES.
@@ -235,6 +251,18 @@ def choose_aadhaar_name(
     for candidate in extract_name_candidates(text):
         if candidate not in candidates:
             candidates.append(candidate)
+
+    # The guardian is printed on a LABELLED line ("Husband :", "W/O", ...), so
+    # it is known by name rather than guessed — and whoever that is, they are
+    # not the holder. Excluding them is the one content-free fact available
+    # here, and it has to be applied before ranking because support alone gets
+    # this backwards: the guardian is set in Latin capitals and survives a bad
+    # page scan that mangles the holder's mixed-case line, so it can out-count
+    # the holder outright rather than merely tying. On GIRIJAMMA's card the
+    # husband BASAVARAJU scored 5 to her 3, and the count-then-position rule
+    # returned the husband as the holder.
+    if guardian_name:
+        candidates = [c for c in candidates if c != guardian_name]
 
     if not candidates:
         return None
@@ -355,19 +383,22 @@ def extract_aadhaar_card(
 
     aadhaar_number = crop_number or full_number
 
+    dob = crop_dob or full_dob
+    gender = crop_gender or full_gender
+
+    vid = extract_vid(text)
+    # Resolved BEFORE the holder name so the guardian can be excluded from the
+    # holder candidates; the crop read is not exempt, having itself returned
+    # the husband's name on GIRIJAMMA's card.
+    guardian = extract_guardian(text)
+    address = extract_address(text)
+
     # Crop name is the most reliable source, so it WINS when present — but it
     # must not be the only source. full_name was computed above and then
     # discarded, so a card whose name crop failed reported name=null even
     # though the full-page text contained it. Falling back does not overwrite a
     # crop read; it only fills the gap, matching how number/dob/gender behave.
-    name = choose_aadhaar_name(text, crop_name)
-
-    dob = crop_dob or full_dob
-    gender = crop_gender or full_gender
-
-    vid = extract_vid(text)
-    guardian = extract_guardian(text)
-    address = extract_address(text)
+    name = choose_aadhaar_name(text, crop_name, guardian["guardian_name"])
 
     if not guardian["guardian_name"]:
         guardian["guardian_name"] = guardian_from_address(address)

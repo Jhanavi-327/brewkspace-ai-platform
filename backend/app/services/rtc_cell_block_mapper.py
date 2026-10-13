@@ -52,7 +52,28 @@ def find_decimal_values(text: str) -> List[str]:
 
 
 def find_mr_number(text: str) -> Optional[str]:
-    return find_first(r"(MR\s*[A-Z]?\d+\/\d{4}-\d{4})", text)
+    """
+    First MR reference whose year range is a real one.
+
+    A mutation year is an accounting year, so the two halves are always
+    consecutive: 2004-2005, 2017-2018, 2019-2020. Taking the first match
+    outright reported "MR 17/2015-2620" as the mutation number of the Yalahanka
+    survey — 2620 is not a year, it is Tesseract reading 2020 through the
+    "For Viewing Only" watermark, and the page carries eleven MR references for
+    it to pick from. Requiring the years to run consecutively costs a genuine
+    reference nothing and drops the impossible ones.
+    """
+    for match in re.finditer(
+        r"MR\s*[A-Z]?\d+\/(\d{4})-(\d{4})",
+        text or ""
+    ):
+        start_year = int(match.group(1))
+        end_year = int(match.group(2))
+
+        if end_year == start_year + 1:
+            return clean_text(match.group(0))
+
+    return None
 
 
 def find_court_reference(text: str) -> Optional[str]:
@@ -154,7 +175,8 @@ def extract_header_from_fallback(
 def extract_header_from_cells(
     cells_with_text,
     fallback=None,
-    raw_text=None
+    raw_text=None,
+    header_strip_text=None
 ):
     
     print("HEADER RAW TEXT TYPE:", type(raw_text))
@@ -250,6 +272,11 @@ def extract_header_from_cells(
             value = clean_text(value)
 
             bad_village_words = [
+                # "ಗ್ರಾಮ ನಮೂನೆ 2" (Village Form No. 2) is printed in the corner
+                # of every RTC, so the village label matches there first. OCR
+                # drops the trailing vowel often enough that only spelling it
+                # both ways catches it — "ನಮೂನ ೨" was reported as the village.
+                "ನಮೂನ",
                 "ನಮೂನೆ",
                 "Valid",
                 "from",
@@ -267,7 +294,38 @@ def extract_header_from_cells(
             if value and not any(word in value for word in bad_village_words):
                 header["village"] = value
 
+    # The taluk/hobli/village line sits above the table border, so it is in no
+    # cell and only whole-page OCR can see it — and on a watermarked scan that
+    # pass loses the labels entirely. A crop of just that strip reads them when
+    # the full page cannot. It is applied ONLY to fields still missing, so a
+    # value the page text did produce is never replaced: the page read gives
+    # RTC 59-P4 its taluk correctly, while the strip is what gives the
+    # Yalahanka RTC a village at all.
+    if header_strip_text and not header["village"]:
+        # Only the VILLAGE is taken from the strip. Its label survives the crop
+        # intact and is followed by a colon, so it can be cut out exactly. The
+        # taluk and hobli labels do not survive on a watermarked scan — the
+        # Yalahanka strip reads "ಹೆ.ಡೀ!2ಳಿ" for ಹೋಬಳಿ — which leaves nothing to
+        # anchor to and yields the whole line as the value. A tangled taluk is
+        # worse than the null the page pass already gives.
+        #
+        # The colon is required: "ಗ್ರಾಮ ನಮೂನೆ 2" (Village Form No. 2) is printed
+        # in the corner and would otherwise match first.
+        village_match = re.search(
+            r"ಗ್ರಾಮ[^\s:：]*\s*[:：]\s*([^|\n]+)",
+            header_strip_text
+        )
+
+        if village_match:
+            value = village_match.group(1)
+            value = re.split(r"ಪುಟ|ನಮೂನ", value)[0]
+            value = clean_text(value).strip(" :：|.,-")
+
+            if value and len(value) > 2:
+                header["village"] = value
+
     return header
+
 
 def extract_survey_number(
     cells_with_text: List[Dict[str, Any]],
@@ -277,30 +335,79 @@ def extract_survey_number(
 
     normalized_text = kannada_digits_to_english(text)
 
-    # 1. Cell-based: look for cell containing "1. ಸರ್ವೆ"
-    for cell in cells_with_text:
-        cell_text = kannada_digits_to_english(
-            clean_text(cell.get("text", ""))
-        )
-
-        if "ಸರ್ವೆ" in cell_text or "ಸರ್ವ" in cell_text:
-            match = re.search(
-                r"(?:ಸರ್ವೆ|ಸರ್ವ|ನಂಬರು|ನಂಬರ್)\s*([A-Za-z0-9\/\-\*]+)",
-                cell_text
-            )
-
-            if match:
-                value = clean_text(match.group(1))
-                return value
-
-    # 2. OCR fallback
-    match = re.search(
-        r"1\s*[\.,]?\s*(?:ಸರ್ವೆ|ಸರ್ವ)\s*(?:ನಂಬರು|ನಂಬರ್)?\s*([A-Za-z0-9\/\-\*]+)",
-        normalized_text
+    # The label is printed with a separator after it — "1. ಸರ್ವೆ ನಂಬರು: 59" —
+    # and ":" is in neither \s* nor the value character class, so the pattern
+    # could not step over it. The cell branch therefore NEVER matched on an RTC
+    # that prints the colon (the common case), and every such document fell
+    # through to the page-wide searches below, which scan the whole sheet and
+    # can return a number belonging to another block entirely. Accept the
+    # separator, and ಸಂಖ್ಯೆ as a label variant alongside ನಂಬರು.
+    # ಸಂಬರು / ಸಂಬರ್ are ನಂಬರು with its ನ read as ಸ — a routine confusion between
+    # two similar Kannada letters, and common enough to cost real values: the
+    # Vajarahalli RTC prints its survey number 72 perfectly legibly, but the
+    # label came back "ಸಂಬರು" and the pattern could not reach past it.
+    label_value_re = re.compile(
+        r"(?:ಸರ್ವೆ|ಸರ್ವ|ನಂಬರು|ನಂಬರ್|ಸಂಬರು|ಸಂಬರ್|ಸಂಖ್ಯೆ|ಸಂಖ್ಯ)\s*[:;.\-~]*\s*"
+        r"([A-Za-z0-9\/\-\*]+)"
     )
 
-    if match:
-        return clean_text(match.group(1))
+    # 1. Cell-based: look for cell containing "1. ಸರ್ವೆ"
+    for cell in cells_with_text:
+        raw_cell_text = clean_text(cell.get("text", ""))
+
+        # Digit translation is one character for one character, so a span in
+        # the converted string covers the same span in the original — which is
+        # what lets the script check below look at what was actually printed.
+        cell_text = kannada_digits_to_english(raw_cell_text)
+
+        if "ಸರ್ವೆ" in cell_text or "ಸರ್ವ" in cell_text:
+            for match in label_value_re.finditer(cell_text):
+                value = clean_text(match.group(1))
+
+                printed = raw_cell_text[match.start(1):match.end(1)]
+
+                # A survey number is printed in ONE script. A value mixing
+                # Kannada and Latin digits was not read, it was guessed at:
+                # RTC 59-P4's number 59 came back "೨9", a Kannada 2 beside a
+                # Latin 9. Converting that yields a perfectly plausible "29"
+                # for a parcel that is actually 59, so the mixture itself has
+                # to be the signal — there is nothing else to catch it by.
+                has_kannada_digit = any("\u0CE6" <= c <= "\u0CEF" for c in printed)
+                has_latin_digit = any(c.isdigit() and c.isascii() for c in printed)
+
+                if has_kannada_digit and has_latin_digit:
+                    continue
+
+                # A survey number always carries a digit. Without one the cell
+                # was misread rather than read — Tesseract returned "og" for
+                # the "59" on a Yalahanka RTC — and a letter blob must not be
+                # reported as a parcel identifier.
+                if any(character.isdigit() for character in value):
+                    return value
+
+            # This cell IS the survey-number box; it was simply not legible.
+            # Stop here rather than falling through to the page-wide searches
+            # below: they read the entire sheet and will return a number from
+            # some other block, which is worse than reporting nothing. On the
+            # Yalahanka RTC they produced "153" — the total extent 163.00.00.00
+            # misread — for a parcel that is actually 59. A null is reviewable;
+            # a plausible wrong parcel number is not. When no labelled cell is
+            # found at all (grid not detected) the fallbacks still apply.
+            return None
+
+    # 2. OCR fallback. The page text this receives is the concatenation of the
+    # same cells, so it re-reads the survey box among everything else and must
+    # apply the SAME digit test — otherwise it hands back exactly the unreadable
+    # value the cell loop just rejected ("og" for the 59 on a Yalahanka RTC).
+    for match in re.finditer(
+        r"1\s*[\.,]?\s*(?:ಸರ್ವೆ|ಸರ್ವ)\s*(?:ನಂಬರು|ನಂಬರ್|ಸಂಖ್ಯೆ)?"
+        r"\s*[:;.\-~]*\s*([A-Za-z0-9\/\-\*]+)",
+        normalized_text
+    ):
+        value = clean_text(match.group(1))
+
+        if any(character.isdigit() for character in value):
+            return value
 
     return fallback.get("1_survey_number", {}).get("survey_number")
 
@@ -399,6 +506,27 @@ def find_nearest_value_after_label(
 
     return None
 
+def _plausible_parcel_token(value: str) -> bool:
+    """
+    Is this a survey / hissa value rather than an OCR smear?
+
+    Both fields are numeric with optional suffixes ("59", "12/3-A", "2A") and
+    are printed "*" or "-" when the parcel has no subdivision. What they are
+    never made of is letters alone: "Bow" (for a blank hissa) and "og" (for the
+    survey number 59) are the shapes Tesseract produces when it reads a box it
+    cannot resolve, and reporting either as a parcel identifier is worse than
+    reporting nothing, because nothing is reviewable and a plausible number is
+    silently acted on.
+    """
+    if not value:
+        return False
+
+    if any(character.isdigit() for character in value):
+        return True
+
+    return value in {"*", "-"}
+
+
 def extract_hissa(
     cells_with_text: List[Dict[str, Any]],
     text: str,
@@ -410,14 +538,15 @@ def extract_hissa(
     # 1. Strong pattern for merged OCR:
     # captures value between "2. ಹಿಸ್ಸಾ / ಹಿಸಾ" and "5. ಮಣ್ಣಿನ"
     match = re.search(
-        r"2\s*[\.,]?\s*(?:ಹಿಸ್ಸಾ|ಹಿಸಾ)?\s*[\n\s]*([A-Za-z0-9\/\-\*]+)\s*[\n\s]*5\s*[\.,]?\s*ಮಣ್ಣ",
+        r"2\s*[\.,]?\s*(?:ಹಿಸ್ಸಾ|ಹಿಸಾ)?\s*[:;.\-~]*\s*[\n\s]*"
+        r"([A-Za-z0-9\/\-\*]+)\s*[\n\s]*5\s*[\.,]?\s*ಮಣ್ಣ",
         normalized_text,
         re.UNICODE
     )
 
     if match:
         value = clean_text(match.group(1))
-        if value and value not in ["5", "7", "8"]:
+        if value and value not in ["5", "7", "8"] and _plausible_parcel_token(value):
             return value
 
     # 2. Cell-based: look for cell containing hissa
@@ -435,15 +564,19 @@ def extract_hissa(
             cell_text
         )[0]
 
-        match = re.search(
-            r"(?:ಹಿಸ್ಸಾ|ಹಿಸಾ)\s*([A-Za-z0-9\/\-\*]+)",
+        # The label is printed "2. ಹಿಸ್ಸಾ: 1"; without the separator here the
+        # pattern could not reach the value and every colon-printing RTC fell
+        # through to the looser searches below.
+        for match in re.finditer(
+            r"(?:ಹಿಸ್ಸಾ|ಹಿಸಾ|ಹಿಸ್ಸ)\s*[:;.\-~]*\s*([A-Za-z0-9\/\-\*]+)",
             cell_text
-        )
-
-        if match:
+        ):
             value = clean_text(match.group(1))
-            if value and value not in ["5", "7", "8"]:
+            if value and value not in ["5", "7", "8"] and _plausible_parcel_token(value):
                 return value
+
+        # Label found, value unreadable — do not guess from elsewhere.
+        return None
 
     # 3. Layout helper fallback
     value = find_nearest_value_after_label(
@@ -500,6 +633,23 @@ def extract_khata_vara(text: str, fallback: Dict[str, Any]) -> Dict[str, Any]:
         or remaining_extent
     )
 
+    # What is LEFT of a survey cannot exceed the whole of it. A stray mark read
+    # as a digit turns 2.17.00.00 into 12.17.00.00 — a plausible-looking extent
+    # that is ten times the parcel, on a sheet whose total is 3.04.00.00. The
+    # comparison is on the printed acre.gunta groups, which order correctly as
+    # integers without needing to know the units.
+    def extent_key(value):
+        try:
+            return tuple(int(part) for part in value.split("."))
+        except (AttributeError, ValueError):
+            return None
+
+    remaining_key = extent_key(remaining_extent)
+    total_key = extent_key(total_extent)
+
+    if remaining_key and total_key and remaining_key > total_key:
+        remaining_extent = None
+
     return {
         "total_extent": total_extent,
         "phut_kharab_a": phut_kharab_a,
@@ -515,10 +665,48 @@ def extract_land_revenue(
 ) -> Dict[str, Any]:
     old = fallback.get("4_land_revenue", {}) if fallback else {}
 
+    # This used to look for the literal "5.46" — the land revenue of ONE
+    # sample RTC — so the cell branch was dead for every other document and
+    # block 4 always came from the page-level regex fallback, which on RTC
+    # 59-P4 reported the extent 4.00 as the land revenue.
+    #
+    # Identify the cell STRUCTURALLY instead. Block 4's value column is the
+    # only numbers-only cell on the sheet carrying five decimals — one per
+    # printed row: land revenue, jodi, cess, water rate, total. The extent
+    # cells nearby are not confusable: they hold dotted quads like
+    # "4.00.00.00", which this pattern reads as only two decimals each, and
+    # they carry their Kannada labels in the same cell.
+    # Block 4 is printed in the header band at the top of the sheet, so only
+    # the upper part of the page is searched. Without that bound the scan
+    # reaches the cultivation table, whose extent column is also numbers-only
+    # and also carries five decimals: on the Anekal RTC it matched a row of
+    # zeros 64% down the page and reported a land revenue of 0.00 for a sheet
+    # printing 4.54. The real block-4 cells sit at 18% and 27% on the other
+    # documents, so the band is generous: block 4 was measured at 18% and 27%
+    # down on the landscape sheets and 46% on the portrait A4 one, while the
+    # cultivation table that produced the false match starts at 64%.
+    page_height = max(
+        (cell.get("y", 0) for cell in cells_with_text),
+        default=0
+    )
+    header_band = page_height * 0.55 if page_height else None
+
     revenue_text = ""
     for cell in cells_with_text:
         cell_text = clean_text(cell.get("text", ""))
-        if "5.46" in cell_text and "0.00" in cell_text:
+
+        if header_band and cell.get("y", 0) > header_band:
+            continue
+
+        if any("\u0C80" <= character <= "\u0CFF" for character in cell_text):
+            continue
+
+        # EXACTLY five: block 4 prints five rows (land revenue, jodi, cess,
+        # water rate, total), so five is its signature. "At least five" is not
+        # good enough — the cultivation table's extent column is also
+        # numbers-only and produced fifteen decimals on the Yalahanka RTC,
+        # winning the scan and reporting a crop extent as the cess.
+        if len(find_decimal_values(cell_text)) == 5:
             revenue_text = cell_text
             break
 
@@ -532,6 +720,49 @@ def extract_land_revenue(
             "water_rate": values[3],
             "total_revenue": values[4],
         }
+
+    # Nothing matched by shape. That happens when the grid detector merges
+    # block 4 into the extents column beside it — the Anekal sheet came back as
+    # one cell reading "3.04.00.00 | (0) ಭೂಕಂದಾಯ | 4.54 0.27.00.00 (ಬ) ಜೋಡಿ
+    # 0.00 ..." — where the printed row labels are the only thing separating
+    # the two columns. Read the values off those labels instead.
+    label_patterns = (
+        ("land_revenue", r"ಭೂ\s*ಕಂದಾಯ"),
+        ("jodi", r"ಜೋಡಿ"),
+        ("cess", r"ಸೆಸ್ಸು|ಸಸ್ಸು|ಸೆಸ್ತು"),
+        ("water_rate", r"ನೀರಿನ\s*ದರ|ನೀರಿಗೆ"),
+        ("total_revenue", r"ಒಟ್ಟು"),
+    )
+
+    for cell in cells_with_text:
+        cell_text = clean_text(cell.get("text", ""))
+
+        if "ಕಂದಾಯ" not in cell_text:
+            continue
+
+        labelled = {}
+
+        for field, label in label_patterns:
+            # A short reach only, so a number belonging to the extents column
+            # further along the merged line cannot be adopted as a revenue.
+            match = re.search(
+                rf"(?:{label})[^\d]{{0,12}}(\d+\.\d+)(?!\.)",
+                cell_text
+            )
+
+            if match:
+                labelled[field] = match.group(1)
+
+        # The land revenue is the defining row: without it this is not block 4
+        # and the reading is not worth preferring over what the fallback holds.
+        if labelled.get("land_revenue"):
+            return {
+                field: labelled.get(field) or old.get(field)
+                for field in (
+                    "land_revenue", "jodi", "cess",
+                    "water_rate", "total_revenue",
+                )
+            }
 
     return {
         "land_revenue": old.get("land_revenue"),
@@ -557,13 +788,35 @@ def extract_soil_type(text: str) -> Dict[str, Any]:
     }
 
 
-def extract_land_classification(text: str) -> Dict[str, Any]:
+def extract_land_classification(
+    text: str,
+    raw_text: Optional[str] = None
+) -> Dict[str, Any]:
     classification = None
 
-    if "ಸರ್ಕಾರಿ" in text:
-        classification = "ಸರ್ಕಾರಿ"
-    elif "ಪಟ್ಟಾ" in text:
-        classification = "ಪಟ್ಟಾ"
+    # "6. ಪಟ್ಟಾ" is block 6's printed HEADING and appears on every RTC, so a
+    # bare `"ಪಟ್ಟಾ" in text` can never fail — whenever the real value was not
+    # legible the heading was returned in its place. The Anekal RTC is
+    # classified ಸರ್ಕಾರಿ and reported "ಪಟ್ಟಾ" for exactly that reason.
+    # Removing the numbered heading first leaves only a genuine value behind.
+    #
+    # The cell text is consulted first and the whole-page text second: block 6
+    # is a narrow box that the grid detector often swallows into a neighbour
+    # (on the Anekal sheet its cell kept the heading and lost the value), while
+    # the page pass read "6. ಪಟ್ಟಾ ಸರ್ಕಾರಿ" cleanly.
+    for source in (text, raw_text):
+        if not source:
+            continue
+
+        without_heading = re.sub(r"\d\s*[.,]?\s*ಪಟ್ಟಾ", " ", source)
+
+        if "ಸರ್ಕಾರಿ" in without_heading:
+            classification = "ಸರ್ಕಾರಿ"
+            break
+
+        if "ಪಟ್ಟಾ" in without_heading:
+            classification = "ಪಟ್ಟಾ"
+            break
 
     return {
         "land_classification": classification,
@@ -685,6 +938,22 @@ def extract_owner_details(
         if any(word.lower() in text.lower() for word in ignore_words):
             return False
 
+        # "12. ಸಾಗುವಳಿ...", "9. ಕಬ್ಜೆ...": every RTC block is titled with its
+        # number, and those titles sit in the same column as the values. The
+        # heading of block 12 was being reported as the sole owner of the
+        # Yalahanka survey while the five real names sat in a cell below it.
+        if re.match(r"^\s*\d{1,2}\s*[.,]", text):
+            return False
+
+        # Block 11 heads its two columns "ಹಕ್ಕುಗಳು:" (rights) and "ಋಣಗಳು:"
+        # (liabilities), and they sit inside the ownership band. OCR mangles
+        # them past the word list above — they came back "ಸಕ್ನುಗಳು;" and
+        # "ಖುಣಗಳು:" and were reported as the two owners of the survey. The
+        # punctuation is the giveaway that survives the mangling: a printed
+        # label ends in a colon, a person's name does not.
+        if text.rstrip().endswith((":", ";", "：")):
+            return False
+
         if re.fullmatch(r"[\d\.\-/\s|\\_]+", text):
             return False
 
@@ -758,6 +1027,17 @@ def extract_owner_details(
 
     # 3. Fallback: use cultivation/cultivator first column
     # This helps Government RTCs where owner and cultivator are same.
+    # Take the FULLEST candidate rather than the first one down the page. The
+    # names live in one tall cell spanning the cultivator column, and several
+    # thinner cells — a stray mark, a clipped heading, an OCR smear — sit above
+    # it in the same column. First-match-wins reported ". ಬಓಟ್ನ್ಟೀಣ್ಣ | af"
+    # (18 characters of noise) over the 181-character cell holding
+    # "ಸರ್ಕಾರಿ ಖರಾಬು ಗೋಮಾಳ ರಾಜಣ್ಣ ಬಿನ್ ಆಂಜನಪ್ಪ ...". Kannada characters, not
+    # raw length, decide it, so a long Latin smear cannot win.
+    best_cell = None
+    best_text = ""
+    best_score = 0
+
     for cell in cells_with_text:
         row = cell.get("row", -1)
         col = cell.get("column", -1)
@@ -773,15 +1053,21 @@ def extract_owner_details(
             if not is_valid_owner_text(text):
                 continue
 
-            return [{
-                "owner_name": text,
-                "father_or_spouse_name": None,
-                "address": None,
-                "extent": None,
-                "khata_no": None,
-                "possession_type": None,
-                "raw_text": cell.get("text", "")
-            }]
+            score = sum(1 for c in text if "\u0C80" <= c <= "\u0CFF")
+
+            if score > best_score:
+                best_cell, best_text, best_score = cell, text, score
+
+    if best_cell:
+        return [{
+            "owner_name": best_text,
+            "father_or_spouse_name": None,
+            "address": None,
+            "extent": None,
+            "khata_no": None,
+            "possession_type": None,
+            "raw_text": best_cell.get("text", "")
+        }]
 
     # 4. Final fallback
     return fallback.get(
@@ -1263,7 +1549,8 @@ def map_rtc_cells_to_blocks(
     cells_with_text: List[Dict[str, Any]],
     table_layout: Optional[Dict[str, Any]] = None,
     fallback_extraction: Optional[Dict[str, Any]] = None,
-    raw_text: Optional[str] = None
+    raw_text: Optional[str] = None,
+    header_strip_text: Optional[str] = None
 ) -> Dict[str, Any]:
     print("INSIDE CELL MAPPER")
     fallback_extraction = fallback_extraction or {}
@@ -1273,7 +1560,8 @@ def map_rtc_cells_to_blocks(
     header = extract_header_from_cells(
         cells_with_text,
         fallback_extraction,
-        raw_text
+        raw_text,
+        header_strip_text
     )
 
     survey_number = extract_survey_number(
@@ -1376,7 +1664,8 @@ def map_rtc_cells_to_blocks(
         ),
 
         "6_land_classification": extract_land_classification(
-            text
+            text,
+            raw_text
         ),
 
         "7_tree_details": tree_details,
@@ -1414,11 +1703,13 @@ def map_rtc_cells(
     cells_with_text,
     table_layout=None,
     fallback_extraction=None,
-    raw_text=None
+    raw_text=None,
+    header_strip_text=None
 ):
     return map_rtc_cells_to_blocks(
         cells_with_text=cells_with_text,
         table_layout=table_layout,
         fallback_extraction=fallback_extraction,
-        raw_text=raw_text
+        raw_text=raw_text,
+        header_strip_text=header_strip_text
     )

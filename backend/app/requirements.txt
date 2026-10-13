@@ -1,0 +1,38 @@
+# ---- Web framework / API ----
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20          # UploadFile in app/api/documents.py
+
+# ---- Config / validation ----
+pydantic[email]==2.13.5
+pydantic-settings==2.7.1          # app/core/config.py
+email-validator==2.2.0            # EmailStr in app/schemas/auth.py
+
+# ---- Database ----
+SQLAlchemy==2.0.36
+psycopg2-binary==2.9.10           # DATABASE_URL is postgresql://
+
+# ---- Auth ----
+python-jose[cryptography]==3.3.0  # from jose import jwt
+passlib[bcrypt]==1.7.4            # from passlib.context import CryptContext
+bcrypt==4.0.1                     # passlib 1.7.4 warns on bcrypt >= 4.1
+
+# ---- Google Gemini ----
+google-genai==2.23.0               # from google import genai
+
+# ---- Imaging / PDF ----
+Pillow==11.1.0                    # from PIL import ...
+PyMuPDF==1.25.2                   # import fitz
+opencv-python==4.10.0.84          # import cv2
+numpy==1.26.4                     # pinned <2 for easyocr/torch compatibility
+
+# ---- OCR ----
+pytesseract==0.3.13               # needs system binary: brew install tesseract
+easyocr==1.7.2
+torch==2.5.1                      # easyocr backend; also check_gpu.py
+torchvision==0.20.1               # required by easyocr
+zxing-cpp==2.3.0                  # import zxingcpp (Aadhaar QR, optional path)
+
+# ---- Observability ----
+langsmith==0.3.45                 # tracing; 0.4+ wants websockets>=15,
+                                  # which google-genai 1.2 forbids

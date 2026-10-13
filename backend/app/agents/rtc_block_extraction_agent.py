@@ -52,20 +52,40 @@ def extract_header(text: str) -> Dict[str, Any]:
 
     for i, line in enumerate(lines):
 
+        # Taluk, hobli and village are printed across ONE header row, and OCR
+        # often returns that row as a single line:
+        #
+        #   ತಾಲ್ಲೂಕು ಮೊಹರು ತಾಲ್ಲೂಕು: ಯಲಹ೦ಕ ಹೋಬಳಿ: ಜಾಲ2 ಗ್ರಾಮ: ಕುದುರೆಗೆರೆ ಪುಟದ ...
+        #
+        # Capturing "everything after the label" then hands the whole remainder
+        # back as the value — a screenshot of the Yalahanka RTC reported its
+        # taluk as "ತಾಲ್ಲೂಕು ಯಲಹ೦ಕ ಹೋಬಳಿ . ಹಾಲ2 ಗ್ರಾಮ *ುದುರೆಗೆರೆ ಪುಟದ ಕ್ರಮ
+        # ಸಂಖ್ಯೆ". Each value has to stop where the next label begins.
+        def cut_at(value, stops):
+            for stop in stops:
+                value = value.split(stop)[0]
+
+            # clean_value returns None for an empty string.
+            return (clean_value(value) or "").strip(" :：.,-")
+
         # Taluk
         if "ತಾಲ್ಲೂಕು" in line or "ತಾಲ್ಲೂ ಕು" in line:
-            match = re.search(r"ತಾಲ್ಲೂ\s*ಕು\s*[:：]?\s*(.*)", line)
-            if match:
-                value = clean_value(match.group(1))
-                value = value.replace("ಮೊಹರು", "").strip()
-                if value:
-                    header["taluk"] = value
+            # Greedy prefix: the row prints "ತಾಲ್ಲೂಕು ಮೊಹರು" (the taluk SEAL)
+            # before the taluk itself, so the last label on the line is the
+            # one carrying the value.
+            value = re.sub(r".*ತಾಲ್ಲೂ\s*ಕು\s*[:：]?\s*", "", line)
+            value = value.replace("ಮೊಹರು", "")
+            value = cut_at(value, ("ಹೋಬಳಿ", "ಹೋಬಲಿ", "ಹೋಬ", "ಗ್ರಾಮ", "ಪುಟ"))
+
+            if value:
+                header["taluk"] = value
 
         # Hobli
         if "ಹೋಬಳಿ" in line or "ಹೋಬಲಿ" in line:
             match = re.search(r"ಹೋಬ[ಳಲ]ಿ\s*[:：]?\s*(.*)", line)
             if match:
-                value = clean_value(match.group(1))
+                value = cut_at(match.group(1), ("ಗ್ರಾಮ", "ಪುಟ"))
+
                 if value:
                     header["hobli"] = value
                 elif i + 1 < len(lines):
@@ -75,24 +95,52 @@ def extract_header(text: str) -> Dict[str, Any]:
         if "ಗ್ರಾಮ" in line:
             match = re.search(r"ಗ್ರಾಮ\s*[:：]?\s*(.*)", line)
             if match:
-                value = clean_value(match.group(1))
+                value = cut_at(match.group(1), ("ಪುಟ",))
 
                 # If OCR puts village on next line
                 if not value and i + 1 < len(lines):
                     value = clean_value(lines[i + 1])
 
-                # Do not accept page/order labels
-                if value and "ಪುಟ" not in value:
+                # "ಗ್ರಾಮ ನಮೂನೆ 2" (Village Form No. 2) is printed in the corner
+                # of every RTC and matches the village label first; OCR drops
+                # the trailing vowel often enough to need both spellings.
+                if value and not any(
+                    bad in value
+                    for bad in ("ಪುಟ", "ನಮೂನ", "ನಮೂನೆ", "Valid", "ಫಾರಂ")
+                ):
                     header["village"] = value
 
-    header["valid_from"] = (
+    # Bhoomi prints the validity window in TWO formats, and only one was read:
+    #
+    #   Valid from 14/09/2020 To Till Date                    (Vajarahalli)
+    #   Valid from 2010-05-28 16:47:00 To 2021-02-05 10:41:00 (RTC 59-P4)
+    #
+    # The second is the older ISO-with-timestamp form, and matching only
+    # DD/MM/YYYY lost BOTH dates on every RTC that uses it. The ISO readings are
+    # normalised to DD/MM/YYYY so the field means the same thing whichever
+    # format the source document happened to print.
+    def normalise_date(value):
+        if not value:
+            return None
+
+        iso = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", value)
+
+        if iso:
+            return f"{iso.group(3)}/{iso.group(2)}/{iso.group(1)}"
+
+        return value
+
+    header["valid_from"] = normalise_date(
         find_first(r"Valid from\s*([0-9]{2}\/[0-9]{2}\/[0-9]{4})", text)
+        or find_first(r"Valid from\s*([0-9]{4}-[0-9]{2}-[0-9]{2})", text)
         or find_first(r"from\s*([0-9]{2}\/[0-9]{2}\/[0-9]{4})", text)
+        or find_first(r"from\s*([0-9]{4}-[0-9]{2}-[0-9]{2})", text)
     )
 
-    header["valid_to"] = (
+    header["valid_to"] = normalise_date(
         find_first(r"To\s*(Till Date)", text)
         or find_first(r"To\s*([0-9]{2}\/[0-9]{2}\/[0-9]{4})", text)
+        or find_first(r"To\s*([0-9]{4}-[0-9]{2}-[0-9]{2})", text)
     )
 
     return header

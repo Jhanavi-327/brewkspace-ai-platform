@@ -229,6 +229,43 @@ def _best_candidate(field: str, candidates):
     return max(ranked, key=lambda value: _score_candidate(field, value))
 
 
+def _disposal_year(ocr_text):
+    r"""
+    Pick the TRANSACTION year ("ವಹಿವಾಟು ವರ್ಷ") from the header.
+
+    Taking the first \d{4}-\d{4} in the document reads the wrong year on any
+    MR that cites earlier mutations: the liabilities column is dense with
+    references like "MR 41/2009-2010" and "MR 145/2004-2005", and they are
+    printed ABOVE the header in the OCR text whenever the engine that read the
+    header cleanly is not the first one emitted. On H62/2018-19 that produced
+    disposal_year "2009-2010" for a 2018-2019 mutation — the header's own
+    "2018-2019" was fine in the Tesseract pass, but EasyOCR ran first and read
+    it "2018-20]9", which the pattern cannot match.
+
+    A cited year is part of an MR reference and always follows the reference
+    number, so it carries a "/" or "-" immediately before it; the header year
+    does not. That separator alone removed 32 of this document's 38 matches,
+    all of them citations. Among what is left the header year wins on count,
+    each OCR pass having read it independently.
+    """
+    counts = {}
+    order = {}
+
+    for match in _YEAR_RANGE_RE.finditer(ocr_text or ""):
+        # A citation ("41/2009-2010"); not the header's transaction year.
+        if ocr_text[max(0, match.start() - 1):match.start()] in "/-":
+            continue
+
+        value = match.group(0)
+        counts[value] = counts.get(value, 0) + 1
+        order.setdefault(value, match.start())
+
+    if not counts:
+        return None
+
+    return max(counts, key=lambda v: (counts[v], -order[v]))
+
+
 def _signatory(lines):
     """
     The signing-officer line. Prefer one naming the officer (ರಾಜಸ್ವ ನಿರೀಕ್ಷಕರು)
@@ -380,9 +417,9 @@ def extract_mutation_register_from_ocr(ocr_text: str) -> dict:
     if namune:
         recovered["namune"] = namune.group(1)
 
-    year = _YEAR_RANGE_RE.search(ocr_text)
+    year = _disposal_year(ocr_text)
     if year:
-        recovered["disposal_year"] = year.group(0)
+        recovered["disposal_year"] = year
 
     # An MR number may carry a letter prefix (e.g. an "H" or "T"). Only one engine
     # tends to keep it, and a bare number is what you get when the prefix is lost,

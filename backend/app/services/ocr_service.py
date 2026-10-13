@@ -1,5 +1,6 @@
 import io
 import os
+import shutil
 import re
 import fitz
 import cv2
@@ -10,7 +11,12 @@ import numpy as np
 from PIL import Image
 
 
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+# Resolve the tesseract binary per-machine: an explicit TESSERACT_CMD wins,
+# otherwise fall back to whatever is on PATH. Leaving it unset lets
+# pytesseract raise its own error rather than pointing at a missing path.
+_tesseract_cmd = os.environ.get("TESSERACT_CMD") or shutil.which("tesseract")
+if _tesseract_cmd:
+    pytesseract.pytesseract.tesseract_cmd = _tesseract_cmd
 
 TESSERACT_LANG = "kan+eng"
 EASYOCR_LANGS = ["kn", "en"]
@@ -167,6 +173,50 @@ def run_hybrid_ocr(image_np, preprocess: bool = True) -> str:
     )
 
 
+# A scan of a landscape RTC is often stored portrait, with the content lying on
+# its side. Nothing downstream survives that: Tesseract reads sideways glyphs as
+# noise, and the table detector looks for the ruled grid along the wrong axis.
+# RTC 12-6 is such a scan — at its stored orientation the page yielded 458
+# Kannada glyphs and NOT ONE of the fourteen RTC keywords, while the same image
+# turned 270 degrees gave 759 glyphs and seven keywords.
+#
+# Tesseract's own orientation detector identifies this, and identifies it
+# confidently: it reported Rotate 270 at confidence 11.92 for that page and
+# Rotate 0 for every other document tested (four RTCs, two Aadhaar cards and a
+# Mutation Register), so correcting on its verdict leaves upright pages
+# untouched. It refuses outright on some images ("Invalid resolution 0" on one
+# Aadhaar PDF), which is not an error worth failing a document over — an
+# unrotated page is exactly what we would have used anyway.
+_MIN_ORIENTATION_CONFIDENCE = 2.0
+
+
+def auto_rotate_for_ocr(image_np):
+    try:
+        osd = pytesseract.image_to_osd(image_np)
+    except Exception:
+        return image_np
+
+    fields = dict(
+        line.split(": ", 1)
+        for line in osd.strip().splitlines()
+        if ": " in line
+    )
+
+    try:
+        clockwise = int(fields.get("Rotate", 0)) % 360
+        confidence = float(fields.get("Orientation confidence", 0))
+    except ValueError:
+        return image_np
+
+    if clockwise == 0 or confidence < _MIN_ORIENTATION_CONFIDENCE:
+        return image_np
+
+    # np.rot90 turns anticlockwise; Tesseract reports the clockwise correction.
+    return np.ascontiguousarray(
+        np.rot90(image_np, (4 - clockwise // 90) % 4)
+    )
+
+
 def pdf_page_to_image(page, dpi: int = _RENDER_DPI):
     pix = page.get_pixmap(dpi=dpi)
 
@@ -176,7 +226,7 @@ def pdf_page_to_image(page, dpi: int = _RENDER_DPI):
         pix.samples
     )
 
-    return np.array(image)
+    return auto_rotate_for_ocr(np.array(image))
 
 
 # A rendered page can be unreadable even at high DPI when the PDF places a

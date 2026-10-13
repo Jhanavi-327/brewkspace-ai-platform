@@ -38,6 +38,9 @@ from app.services.rtc_cell_block_mapper import map_rtc_cells
 from app.agents.classifier_agent import classify_document_text
 from app.agents.rtc_block_extraction_agent import extract_rtc_blocks
 from app.services.gemini_rtc_test_service import rtc_gemini_test
+from app.services.kyc.aadhaar_mapper import map_aadhaar_fields
+from app.services.kyc.pan_mapper import map_pan_fields
+from app.services.kyc.pan_mapper import map_pan_fields
 
 router = APIRouter()
 
@@ -212,64 +215,37 @@ def process_document(
         completeness_percentage = None
 
         classification = classification_result["classification"]
+        pan_extraction_details = None
 
         # --------------------------------------------------
         # AADHAAR FALLBACK CLASSIFICATION
         # --------------------------------------------------
+        # Aadhaar fallback requires document-specific evidence.
+        # A plausible crop name, date or number does not identify Aadhaar.
         if classification == "Unclassified":
+            raw_upper = (extracted_text or "").upper()
 
-            raw_text = extracted_text or ""
-            raw_upper = raw_text.upper()
-
-            aadhaar_number_match = re.search(
-                r"\b\d{4}[\s_]*\d{4}[\s_]*\d{4}\b",
-                raw_text
+            has_aadhaar_identity = bool(
+                re.search(
+                    r"\b(?:AADHAAR|AADHAR|UIDAI)\b",
+                    raw_upper,
+                )
+                or "UNIQUE IDENTIFICATION AUTHORITY" in raw_upper
             )
 
-            is_aadhaar = (
-                "AADHAAR" in raw_upper
-                or "AADHAR" in raw_upper
-                or "UIDAI" in raw_upper
-                or "UIDAI.GOV.IN" in raw_upper
-                or "UNIQUE IDENTIFICATION" in raw_upper
-                or "IDENTIFICATION AUTHORITY" in raw_upper
-                or aadhaar_number_match
-            )
-
-            # --------------------------------------------------
-            # Image based fallback
-            # --------------------------------------------------
-            if not is_aadhaar:
-                try:
-                    from app.services.kyc.aadhaar_crop_ocr import (
-                        extract_aadhaar_fields_from_image
-                    )
-
-                    crop_probe = extract_aadhaar_fields_from_image(
-                        document.storage_path
-                    )
-
-                    if (
-                        crop_probe.get("aadhaar_number")
-                        or crop_probe.get("dob")
-                        or crop_probe.get("gender")
-                        or crop_probe.get("name")
-                    ):
-                        is_aadhaar = True
-
-                except Exception as e:
-                    print("AADHAAR IMAGE FALLBACK:", e)
-
-            if is_aadhaar:
+            if has_aadhaar_identity:
                 classification = "AADHAAR_CARD"
-                classification_result["classification"] = "AADHAAR_CARD"
-                classification_result["confidence"] = 0.90
-                classification_result["candidates"] = [
-                    {
-                        "type": "AADHAAR_CARD",
-                        "confidence": 0.90
-                    }
-                ]
+                classification_result = {
+                    "classification": "AADHAAR_CARD",
+                    "confidence": 0.90,
+                    "candidates": [
+                        {
+                            "type": "AADHAAR_CARD",
+                            "confidence": 0.90,
+                        }
+                    ],
+                }
+
         # --------------------------------------------------
         # RTC PROCESSING
         #
@@ -310,6 +286,17 @@ def process_document(
 
             # Only pay for the slow cell-OCR sweep (hundreds of Tesseract calls
             # per page) when Gemini could not read the document at all.
+            #
+            # PDFs only, and that is a measured choice rather than a technical
+            # limit — the renderer opens an image as readily as a PDF page, and
+            # a screenshot of the Yalahanka RTC does yield 63 cells across 15
+            # rows. But a screenshot is captured at display resolution and the
+            # page-level OCR reads it well, while the per-cell crops of that
+            # same image read it badly. Routing that screenshot through the
+            # cells fixed the header (ಯಲಹಂಕ / ಕುದುರೆಗೆರೆ instead of whole raw
+            # lines) and broke three other fields: survey 59 -> 29, extent
+            # 78.04.00.00 -> 38.04.00.00, and three named owners -> "ಮ್".
+            # Scans need the grid; screenshots do not.
             elif document.file_type == "PDF":
                 try:
                     table_layout = extract_rtc_table_layout(document.storage_path)
@@ -319,11 +306,25 @@ def process_document(
                         table_layout
                     )
 
+                    # The taluk/hobli/village line is printed above the
+                    # table border, so it is in no cell and whole-page OCR is
+                    # its only source — a pass the table drowns out on a
+                    # watermarked scan. Read that strip on its own as well.
+                    from app.services.rtc_cell_ocr_service import (
+                        ocr_header_strip
+                    )
+
+                    header_strip_text = ocr_header_strip(
+                        document.storage_path,
+                        cells_with_text
+                    )
+
                     structured_extraction = map_rtc_cells(
                         cells_with_text=cells_with_text,
                         table_layout=table_layout,
                         fallback_extraction=fallback_extraction,
-                        raw_text=extracted_text
+                        raw_text=extracted_text,
+                        header_strip_text=header_strip_text
                     )
 
                 except Exception as table_error:
@@ -390,7 +391,11 @@ def process_document(
                     combined_pan_text,
                     image_path=document.storage_path
                 )
+            pan_extraction_details = structured_extraction
 
+            structured_extraction = map_pan_fields(
+                pan_extraction_details or {}
+            ).model_dump()
         # --------------------------------------------------
         # AADHAAR CARD PROCESSING
         # --------------------------------------------------
@@ -497,37 +502,91 @@ def process_document(
                 print("Gemini Mutation Register extraction failed:", e)
                 structured_extraction = None
 
-        # --------------------------------------------------
-        # AADHAAR GEMINI FALLBACK ONLY IF OCR MISSES IMPORTANT FIELD
-        #
-        # This fallback is Aadhaar specific. It must never run for a PAN
-        # card, otherwise it overwrites the PAN extraction with an Aadhaar
-        # shaped result (no pan_number, document_type AADHAAR_CARD). A PAN
-        # result has no "aadhaar_number" field, so without this guard the
-        # condition below was always true for PAN cards.
-        # --------------------------------------------------
+        # Check every Aadhaar visually, even when OCR fields are non-empty.
+        aadhaar_extraction_details = None
+        aadhaar_review_required = None
+
         if classification == "AADHAAR_CARD":
-            needs_gemini = (
-                not structured_extraction
-                or not structured_extraction.get("name")
-                or not structured_extraction.get("aadhaar_number")
+            from app.services.kyc.aadhaar_mapper import map_aadhaar_fields
+
+            ocr_extraction = structured_extraction or {}
+            gemini_extraction = None
+            vision_error = None
+
+            try:
+                from app.services.kyc.aadhaar_gemini_extractor import (
+                    extract_aadhaar_card_gemini
+                )
+
+                gemini_extraction = extract_aadhaar_card_gemini(
+                    document.storage_path
+                )
+            except Exception as error:
+                vision_error = type(error).__name__
+                print("Gemini Aadhaar extraction failed:", error)
+
+            fields = (
+                "name",
+                "date_of_birth_or_year",
+                "gender",
+                "aadhaar_number",
+                "address",
             )
 
-            if needs_gemini:
-                try:
-                    from app.services.kyc.aadhaar_gemini_extractor import (
-                        extract_aadhaar_card_gemini
-                    )
+            vision_usable = (
+                isinstance(gemini_extraction, dict)
+                and gemini_extraction.get("document_type") == "AADHAAR_CARD"
+                and any(gemini_extraction.get(field) for field in fields)
+            )
 
-                    gemini_extraction = extract_aadhaar_card_gemini(
-                        document.storage_path
-                    )
+            disagreements = []
 
-                    if gemini_extraction:
-                        structured_extraction = gemini_extraction
+            if vision_usable:
+                for field in fields:
+                    ocr_value = ocr_extraction.get(field)
+                    vision_value = gemini_extraction.get(field)
 
-                except Exception as e:
-                    print("Gemini Aadhaar extraction failed:", e)
+                    if ocr_value and vision_value:
+                        left = " ".join(str(ocr_value).split()).casefold()
+                        right = " ".join(str(vision_value).split()).casefold()
+
+                        if left != right:
+                            disagreements.append({
+                                "field": field,
+                                "ocr": ocr_value,
+                                "vision": vision_value,
+                            })
+
+                # Missing visual fields stay null; do not silently fill them
+                # from the OCR path whose readings may be incorrect.
+                selected = gemini_extraction
+            else:
+                selected = {}
+                vision_error = vision_error or "No usable visual extraction"
+
+            structured_extraction = map_aadhaar_fields(
+                selected
+            ).model_dump()
+
+            aadhaar_review_required = (
+                not vision_usable
+                or bool(disagreements)
+                or bool(ocr_extraction.get("qr_disagreements"))
+                or any(
+                    value is None
+                    for value in structured_extraction.values()
+                )
+            )
+
+            aadhaar_extraction_details = {
+                "ocr": ocr_extraction,
+                "vision": gemini_extraction,
+                "selected_source": "vision" if vision_usable else None,
+                "disagreements": disagreements,
+                "vision_error": vision_error,
+                "review_required": aadhaar_review_required,
+            }
+
         # --------------------------------------------------
         # PROPERTY RECORD SAVE ONLY FOR RTC
         # --------------------------------------------------
@@ -588,6 +647,59 @@ def process_document(
             property_record_saved = True
             property_record_id = property_record.id
 
+        # Map AFTER the property-record code, which uses numbered RTC blocks.
+        rtc_extraction_details = None
+        rtc_review_required = None
+        if classification == "RTC":
+            from app.services.rtc.rtc_mapper import map_rtc_fields
+
+            rtc_extraction_details = structured_extraction or {}
+            structured_extraction = map_rtc_fields(
+                rtc_extraction_details
+            ).model_dump()
+            verification = rtc_extraction_details.get("text_verification") or {}
+            differences = rtc_extraction_details.get("disagreements") or {}
+            rtc_review_required = bool(
+                rtc_extraction_details.get("warnings")
+                or rtc_extraction_details.get("error")
+                or rtc_extraction_details.get("extraction_status") != "extracted"
+                or verification.get("status") == "disagreement"
+                or any(differences.values())
+            )
+            # Unassigned/document-wide entries stay in extraction evidence.
+            unassigned_rights = rtc_extraction_details.get("11_rights_liabilities") or {}
+            unassigned_possession = rtc_extraction_details.get("10_possession_details") or {}
+            if any(unassigned_rights.values()) or any(unassigned_possession.values()):
+                rtc_review_required = True
+                rtc_extraction_details.setdefault("warnings", []).append(
+                    "Some possession or rights information is document-wide or "
+                    "could not be assigned to an owner; inspect rtc_extraction_details."
+                )
+
+            if property_record_saved:
+                property_record.fields = {
+                    **property_record.fields,
+                    "rtc_schema": structured_extraction,
+                }
+
+        # Normalize MR after extraction; keep detailed evidence outside the schema.
+        mr_extraction_details = None
+        mr_review_required = None
+        mr_mapping_warnings = []
+        if classification == "MUTATION_REGISTER":
+            from app.services.mr.mr_mapper import map_mr_fields, mr_requires_review
+
+            mr_extraction_details = structured_extraction or {}
+            mr_model = map_mr_fields(mr_extraction_details, mr_mapping_warnings)
+            mr_review_required = mr_requires_review(
+                mr_extraction_details, mr_model, mr_mapping_warnings
+            )
+            mr_extraction_details = {
+                **mr_extraction_details,
+                "schema_mapping_warnings": mr_mapping_warnings,
+            }
+            structured_extraction = mr_model.model_dump()
+
         document.classification = classification_result["classification"]
         document.classification_confidence = classification_result["confidence"]
 
@@ -600,12 +712,36 @@ def process_document(
             "fallback_regex_extraction": fallback_extraction
         }
 
+        if classification == "AADHAAR_CARD":
+            document.extracted_fields = {
+                **document.extracted_fields,
+                "aadhaar_extraction_details": aadhaar_extraction_details,
+            }
+
+        if classification == "PAN_CARD":
+            document.extracted_fields = {
+                **document.extracted_fields,
+                "pan_extraction_details": pan_extraction_details,
+            }
+
+        if classification == "RTC":
+            document.extracted_fields = {
+                **document.extracted_fields,
+                "rtc_extraction_details": rtc_extraction_details,
+            }
+
+        if classification == "MUTATION_REGISTER":
+            document.extracted_fields = {
+                **document.extracted_fields,
+                "mr_extraction_details": mr_extraction_details,
+            }
+
         document.processing_status = "PROCESSED"
 
         db.commit()
         db.refresh(document)
 
-        return {
+        response = {
             "message": "Document processed successfully",
             "document_id": document.id,
             "classification": document.classification,
@@ -620,7 +756,30 @@ def process_document(
             "raw_text_preview": extracted_text[:3000]
         }
 
+        if classification == "AADHAAR_CARD":
+            response["review_required"] = aadhaar_review_required
+            if aadhaar_review_required:
+                response["message"] = "Document processed; extraction requires review"
+
+        if classification == "RTC":
+            response["review_required"] = rtc_review_required
+            response["extraction_warnings"] = rtc_extraction_details.get("warnings", [])
+            if rtc_review_required:
+                response["message"] = "Document processed; extraction requires review"
+
+        if classification == "MUTATION_REGISTER":
+            response["review_required"] = mr_review_required
+            response["extraction_warnings"] = list(dict.fromkeys(
+                mr_mapping_warnings
+                + (mr_extraction_details.get("mapping_warnings") or [])
+            ))
+            if mr_review_required:
+                response["message"] = "Document processed; extraction requires review"
+
+        return response
+
     except Exception as e:
+        db.rollback()
         document.processing_status = "FAILED"
         db.commit()
 
@@ -628,6 +787,10 @@ def process_document(
             status_code=500,
             detail=f"Document processing failed: {str(e)}"
         )
+
+
+
+
     
 @router.post("/documents/{document_id}/test-gemini")
 def test_gemini(
